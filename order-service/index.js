@@ -1,3 +1,6 @@
+// Order-service role Kafka producer
+// 
+
 const express = require('express');
 const cors = require('cors');
 const { Kafka } = require('kafkajs');

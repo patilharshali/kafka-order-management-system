@@ -1,3 +1,5 @@
+// Inventory-service role Kafka consumer + producer
+
 const { Kafka } = require('kafkajs');
 
 const kafka = new Kafka({ 
@@ -34,6 +36,7 @@ const start = async () => {
                 await producer.send({
                     topic: 'order-updates',
                     messages: [{
+                        key: order.id, // partition key
                         value: JSON.stringify({
                             userId: order.userId, // Use ID from order
                             status: `✅ Inventory Confirmed for order ${order.id}`,
