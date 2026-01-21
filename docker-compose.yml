@@ -22,6 +22,11 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+  redis:
+    image: redis:alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
 
   inventory-service:
     build: ./inventory-service
@@ -46,13 +51,15 @@ services:
   sse-service:
     build: ./sse-service
     container_name: sse-service
-    restart: on-failure  # Add this line
+    restart: on-failure
     ports:
       - "5001:5001"
-    environment:
-      KAFKA_BROKER: kafka:9092
-    depends_on:
+    environment:      # <--- This must be indented 4 spaces
+      - KAFKA_BROKER=kafka:9092
+      - REDIS_URL=redis://redis:6379
+    depends_on:       # <--- This must be indented 4 spaces
       - kafka
+      - redis
 
   # --- FRONTEND: REACT CLIENT ---
   react-app:
