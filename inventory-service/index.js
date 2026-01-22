@@ -3,10 +3,11 @@
 const { Kafka } = require('kafkajs');
 
 const kafka = new Kafka({ 
+    clientId: 'inventory-service',
     brokers: [process.env.KAFKA_BROKER || 'kafka:9092'],
     // Added connection timeout to help with the ECONNREFUSED issues
     connectionTimeout: 10000 ,
-    // Add this to both Inventory and SSE service
+    // TODO: remove from producetion code.Add this to both Inventory and SSE service 
     allowAutoTopicCreation: true
 });
 
@@ -36,7 +37,7 @@ const start = async () => {
                 await producer.send({
                     topic: 'order-updates',
                     messages: [{
-                        key: order.id, // partition key
+                        key: order.userId, // partition key
                         value: JSON.stringify({
                             userId: order.userId, // Use ID from order
                             status: `✅ Inventory Confirmed for order ${order.id}`,
@@ -55,5 +56,17 @@ const start = async () => {
         process.exit(1);
     }
 }
+// Graceful shutdown
+process.on('SIGINT', async () =>{
+    console.log('🛑 Shutting down Inventory Service...')
+    try{
+        await consumer.disconnect();
+        await producer.disconnect();
+        process.exit(0);
+    } catch(err) {
+        console.log('❌ Error during shutdown:', err);
+        process.exit(1);
+    }
+})
 
 start();

@@ -35,89 +35,75 @@ const redisSub = new Redis(REDIS_URL);
 
 /* ======================
    SSE Connection Store
-   userId -> Set<res>
 ====================== */
 const connections = new Map();
 
 /* ======================
-   Utility: Heartbeat for slow clients
+   Auth Middleware
 ====================== */
-function heartbeat(res) {
-  res.write(`:\n\n`); // comment line to keep connection alive
+async function authenticate(req, res, next) {
+  const token = req.query.token;
+  const userId = req.params.userId;
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (decoded.userId !== userId) return res.status(403).end();
+    req.userId = userId;
+    next();
+  } catch {
+    return res.status(401).end();
+  }
 }
 
 /* ======================
    SSE Endpoint
 ====================== */
-app.get('/status/:userId', async (req, res) => {
-  const userId = req.params.userId;
-  const token = req.query.token;
+app.get('/status/:userId', authenticate, async (req, res) => {
+  const userId = req.userId;
 
-  // ----- Auth Check -----
-  try {
-    const decoded = jwt.verify(token, JWT_SECRET);
-    if (decoded.userId !== userId) {
-      return res.status(403).end();
-    }
-  } catch (err) {
-    return res.status(401).end();
-  }
-
-  // ----- Set SSE headers -----
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache');
   res.setHeader('Connection', 'keep-alive');
 
-  // ----- Register connection -----
   if (!connections.has(userId)) connections.set(userId, new Set());
   connections.get(userId).add(res);
 
-  // Heartbeat interval
-  const interval = setInterval(() => heartbeat(res), 15000);
+  const interval = setInterval(() => res.write(':\n\n'), 15000);
 
-  // ----- Disconnect -----
   req.on('close', () => {
     clearInterval(interval);
     connections.get(userId).delete(res);
     if (connections.get(userId).size === 0) connections.delete(userId);
   });
 
-  // ----- Replay last offset if exists -----
-  const lastOffset = await redisPub.get(`user:${userId}:lastOffset`);
-  if (lastOffset) {
-    // Optional: fetch cached events from Redis or DB
-    // Example: send last event to reconnecting client
-    const lastEvent = await redisPub.get(`user:${userId}:lastEvent`);
-    if (lastEvent) res.write(`data: ${lastEvent}\n\n`);
-  }
+  const lastEvent = await redisPub.get(`user:${userId}:lastEvent`);
+  if (lastEvent) res.write(`data: ${lastEvent}\n\n`);
 });
 
 /* ======================
    Redis Subscriber → SSE
 ====================== */
-redisSub.subscribe('order-events');
-redisSub.on('message', (_, message) => {
-  const payload = JSON.parse(message);
-  const { userId } = payload;
+(async () => {
+  await redisSub.subscribe('order-events');
 
-  // Store last event + offset for reconnect
-  if (payload.offset) {
-    redisPub.set(`user:${userId}:lastOffset`, payload.offset);
-  }
-  redisPub.set(`user:${userId}:lastEvent`, JSON.stringify(payload));
+  redisSub.on('message', (_, message) => {
+    try {
+      const payload = JSON.parse(message);
+      const { userId } = payload;
 
-  // Push to all connected SSE clients
-  if (connections.has(userId)) {
-    for (const res of connections.get(userId)) {
-      // Non-blocking write
-      try {
-        res.write(`data: ${JSON.stringify(payload)}\n\n`);
-      } catch (err) {
-        console.warn('Slow client, skipping:', err.message);
+      redisPub.set(`user:${userId}:lastEvent`, JSON.stringify(payload));
+
+      if (!connections.has(userId)) return;
+
+      for (const res of connections.get(userId)) {
+        const ok = res.write(`data: ${JSON.stringify(payload)}\n\n`);
+        if (!ok) console.warn(`Slow client for user ${userId}`);
       }
+    } catch (err) {
+      console.error('Error handling Redis message:', err.message);
     }
-  }
-});
+  });
+})();
 
 /* ======================
    Kafka → Redis Publisher
@@ -127,17 +113,15 @@ async function startKafka() {
   await kafkaConsumer.subscribe({ topic: 'order-updates' });
 
   await kafkaConsumer.run({
-    eachMessage: async ({ topic, partition, message }) => {
-      const payload = JSON.parse(message.value.toString());
+    eachMessage: async ({ message }) => {
+      try {
+        const payload = JSON.parse(message.value.toString());
+        payload.offset = message.offset;
 
-      // Partition key is orderId for per-order ordering
-      payload.partitionKey = payload.orderId || payload.userId;
-
-      // Add Kafka offset for reconnect replay
-      payload.offset = message.offset;
-
-      // Publish to Redis for SSE fan-out
-      await redisPub.publish('order-events', JSON.stringify(payload));
+        await redisPub.publish('order-events', JSON.stringify(payload));
+      } catch (err) {
+        console.error('❌ Kafka -> Redis error:', err.message);
+      }
     }
   });
 
@@ -147,7 +131,23 @@ async function startKafka() {
 /* ======================
    Start Server
 ====================== */
-app.listen(PORT, () => {
-  console.log(`🚀 SSE Service running on port ${PORT}`);
-  startKafka().catch(console.error);
+(async () => {
+  await startKafka();
+  app.listen(PORT, () => {
+    console.log(`🚀 SSE Service running on port ${PORT}`);
+  });
+})();
+
+/* ======================
+   Graceful Shutdown
+====================== */
+process.on('SIGINT', async () => {
+  console.log('🛑 Shutting down SSE Service...');
+  for (const resSet of connections.values()) {
+    for (const res of resSet) res.end();
+  }
+  await kafkaConsumer.disconnect();
+  redisPub.disconnect();
+  redisSub.disconnect();
+  process.exit(0);
 });
